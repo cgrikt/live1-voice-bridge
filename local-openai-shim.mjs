@@ -28,21 +28,34 @@ function run(cmd, args) {
 }
 
 // ---- echo guard: speak-replies が /tmp/live1-playing.json に実再生区間を書く ----
-// 捨てるのは「実再生中+0.4秒」と「再生直後6秒以内の近一致(8文字以上)」だけ。
-// 30秒・70%類似の広域ドロップは本物の訂正発話を殺すため廃止。
+// semi: 再生中+0.4秒は全ドロップ。full: 再生中でも再生文と非類似なら本物の
+// 割り込み発話として通し、barge-inフラグを立てる（speak-repliesが即停止する）。
+// 再生直後6秒以内の近一致(8文字以上)は常にエコーとして捨てる。
 const PLAY_STATE = "/tmp/live1-playing.json";
+const BARGE_FLAG = "/tmp/live1-barge-in";
+const MODE_FILE = `${process.env.HOME}/.paseo/voice-mode.json`;
 const norm = (s) => s.replace(/[\s、。！？!?.,]/g, "");
+const similarity = (a, b) => {
+  if (a.length < 4 || b.length < 4) return false;
+  const set = new Set(b);
+  const hit = [...a].filter((c) => set.has(c)).length;
+  return b.includes(a) || a.includes(b) || hit / a.length >= 0.6;
+};
+const fullDuplex = () => {
+  try { return JSON.parse(readFileSync(MODE_FILE, "utf8")).mode === "full"; }
+  catch { return false; }
+};
 function isEcho(text) {
   try {
     const { until, text: played } = JSON.parse(readFileSync(PLAY_STATE, "utf8"));
     const now = Date.now();
-    if (now < until + 400) return "playing";
     const a = norm(text), b = norm(played ?? "");
-    if (a.length >= 8 && b.length >= 8 && now < until + 6000) {
-      const set = new Set(b);
-      const hit = [...a].filter((c) => set.has(c)).length;
-      if (b.includes(a) || a.includes(b) || hit / a.length >= 0.85) return "echo-like";
+    if (now < until + 400) {
+      if (similarity(a, b) || a.length < 4) return "playing";
+      if (!fullDuplex()) return "playing";           // semi: 再生中は全部エコー扱い
+      return "barge";                                // full: 非類似の本物発話
     }
+    if (a.length >= 8 && b.length >= 8 && now < until + 6000 && similarity(a, b)) return "echo-like";
   } catch { /* no state yet */ }
   return null;
 }
@@ -166,7 +179,16 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const echo = isEcho(text);
-      if (echo) { log(`STT dropped (${echo}):`, text); res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify({ text: "" })); return; }
+      if (echo === "barge") {
+        // 本物の割り込み: フラグを立てて読み上げを止めさせ、本文はエージェントへ通す
+        try { writeFileSync(BARGE_FLAG, String(Date.now())); } catch {}
+        log("STT barge-in:", text);
+      } else if (echo) {
+        log(`STT dropped (${echo}):`, text);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ text: "" }));
+        return;
+      }
       log("STT:", text);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ text }));

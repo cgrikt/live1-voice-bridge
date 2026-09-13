@@ -12,7 +12,7 @@ import { spawn, execFile } from "node:child_process";
 import { writeFileSync, readFileSync, existsSync } from "node:fs";
 import { WebSocketServer } from "ws";
 
-const AGENT = process.argv[2] ?? process.env.AGENT_ID ?? "a235715a-af2a-4630-b0f4-1b8237b31c17";
+const AGENT = process.argv[2] ?? process.env.AGENT_ID ?? "4a5c9f23-ba13-4a79-84ef-61fac7e4bbfc";
 const DAEMON_WS = process.env.PASEO_WS ?? "ws://127.0.0.1:6767/ws";
 const PORT = Number(process.env.PANEL_PORT ?? 8742);
 const VV = process.env.VV_URL ?? "http://127.0.0.1:50021";
@@ -21,12 +21,24 @@ const MUTE_FLAG = `${HOME}/.paseo/voice-mute`;
 const STOP_FLAG = "/tmp/live1-stop-now";
 const VOICE_PROFILE = `${HOME}/.paseo/voice-profile.json`;
 const PLAY_STATE = "/tmp/live1-playing.json";
+const MODE_FILE = `${HOME}/.paseo/voice-mode.json`; // {mode: off|speak|semi|full}
 const log = (...a) => console.log(new Date().toLocaleTimeString("ja-JP"), ...a);
 
 // ---- daemon接続 ----
 let dws = null, daemonUp = false, voiceOn = false, isSpeaking = false, agentBusy = false;
+// daemon側controllerのstart()が終わるまで voice_audio_chunk は無言で捨てられる。
+// 実測で約2秒必要なので、set_voice_mode応答 + ウォームアップ経過の両方を満たすまで送信しない。
+let voiceReady = false, vmAcked = false, warmUntil = 0;
+const WARMUP_MS = 2200;
 let seq = 0;
 const send = (message) => dws?.readyState === 1 && dws.send(JSON.stringify({ type: "session", message }));
+const sendAudio = (message) => {
+  if (!voiceReady) {
+    if (vmAcked && Date.now() >= warmUntil) voiceReady = true;
+    else return;
+  }
+  send(message);
+};
 
 function daemonConnect() {
   dws = new WebSocket(DAEMON_WS);
@@ -57,9 +69,10 @@ function daemonConnect() {
       if (ev?.type === "turn_started") { agentBusy = true; pushState(); }
       if (["turn_completed", "turn_failed", "turn_canceled"].includes(ev?.type)) { agentBusy = false; pushState(); }
     }
-    if (msg?.type === "set_voice_mode_response" || msg?.type === "error") pushState();
+    if (msg?.type === "set_voice_mode_response") { if (voiceOn) vmAcked = true; pushState(); return; }
+    if (msg?.type === "error") pushState();
   };
-  dws.onclose = () => { daemonUp = false; voiceOn = false; stopMic(); pushState(); setTimeout(daemonConnect, 3000); };
+  dws.onclose = () => { daemonUp = false; voiceOn = false; voiceReady = false; vmAcked = false; stopMic(); pushState(); setTimeout(daemonConnect, 3000); };
   dws.onerror = () => { try { dws.close(); } catch {} };
 }
 
@@ -73,7 +86,7 @@ function startMic() {
     rest = Buffer.concat([rest, d]);
     while (rest.length >= 3200) { // 100ms
       const c = rest.subarray(0, 3200); rest = rest.subarray(3200);
-      send({ type: "voice_audio_chunk", audio: c.toString("base64"), format: "audio/pcm;rate=16000;bits=16", isLast: false });
+      sendAudio({ type: "voice_audio_chunk", audio: c.toString("base64"), format: "audio/pcm;rate=16000;bits=16", isLast: false });
     }
   });
   mic.stderr.on("data", (d) => log("mic:", String(d).slice(0, 120)));
@@ -84,6 +97,7 @@ function stopMic() { if (mic) { mic.kill("SIGKILL"); mic = null; } }
 async function setVoice(on) {
   if (!daemonUp) return;
   if (on) {
+    voiceReady = false; vmAcked = false; warmUntil = Date.now() + WARMUP_MS;
     send({ type: "set_voice_mode", enabled: true, agentId: AGENT, requestId: `vm${++seq}` });
     startMic();
     voiceOn = true;
@@ -91,8 +105,24 @@ async function setVoice(on) {
     send({ type: "voice_audio_chunk", audio: "", format: "audio/pcm;rate=16000;bits=16", isLast: true });
     send({ type: "set_voice_mode", enabled: false, agentId: AGENT, requestId: `vm${++seq}` });
     stopMic();
-    voiceOn = false;
+    voiceOn = false; voiceReady = false; vmAcked = false;
   }
+  pushState();
+}
+
+// ---- モード: off / speak / semi / full を1ファイルで全プロセスに共有 ----
+// off:   マイクOFF・返答も文字だけ
+// speak: マイクOFF・返答は音声（読み上げのみ）
+// semi:  マイクON・返答音声。再生中の発話は拾わない（割り込みは「今だけ停止」）
+// full:  マイクON・返答音声。再生中に話すとshimが本物発話と判定→読み上げ即中断
+function readMode() { return readJson(MODE_FILE, { mode: "off" }).mode ?? "off"; }
+async function applyMode(mode) {
+  writeFileSync(MODE_FILE, JSON.stringify({ mode, updatedAt: Date.now() }));
+  if (mode === "off") writeFileSync(MUTE_FLAG, "1");
+  else try { (await import("node:fs")).rmSync(MUTE_FLAG, { force: true }); } catch {}
+  const wantMic = mode === "semi" || mode === "full";
+  if (wantMic !== voiceOn) await setVoice(wantMic);
+  log("mode:", mode);
   pushState();
 }
 
@@ -102,8 +132,9 @@ function state() {
   const replyMuted = existsSync(MUTE_FLAG);
   const play = readJson(PLAY_STATE, {});
   const playing = (play.until ?? 0) > Date.now();
-  const phase = !daemonUp ? "daemon未接続" : !voiceOn ? "待機" : isSpeaking ? "聞き取り中" : agentBusy ? "作業中" : playing ? "発話中" : "入力受付中";
-  return { phase, voiceOn, replyMuted, playing, playingText: playing ? play.text?.slice(0, 40) : null, agentBusy, speaker: readJson(VOICE_PROFILE, { speaker: "3" }).speaker };
+  if (voiceOn && !voiceReady && vmAcked && Date.now() >= warmUntil) voiceReady = true;
+  const phase = !daemonUp ? "daemon未接続" : !voiceOn ? "待機" : !voiceReady ? "準備中…" : isSpeaking ? "聞き取り中" : agentBusy ? "作業中" : playing ? "発話中" : "入力受付中";
+  return { phase, voiceOn, voiceReady, replyMuted, playing, playingText: playing ? play.text?.slice(0, 40) : null, agentBusy, mode: readMode(), speaker: readJson(VOICE_PROFILE, { speaker: "3" }).speaker };
 }
 const uiClients = new Set();
 function pushState() { const s = JSON.stringify({ type: "state", ...state() }); for (const c of uiClients) { try { c.send(s); } catch {} } }
@@ -125,10 +156,16 @@ button.danger{background:#522;border-color:#a44}
 </style>
 <h1>音声パネル <span class="muted" id="conn"></span></h1>
 <div id="phase">…</div>
+<div class="row" id="modes">
+<button data-mode="off" onclick="cmd('mode','off')">OFF</button>
+<button data-mode="speak" onclick="cmd('mode','speak')">読み上げ</button>
+<button data-mode="semi" onclick="cmd('mode','semi')">セミ</button>
+<button data-mode="full" onclick="cmd('mode','full')">フル</button>
+<button class="danger" onclick="cmd('stop')">■ 今だけ停止</button>
+</div>
 <div class="row">
 <button id="mic" onclick="cmd('mic')">🎙 マイク</button>
 <button id="reply" onclick="cmd('reply')">返答:音声+文字</button>
-<button class="danger" onclick="cmd('stop')">■ 今だけ停止</button>
 </div>
 <div class="row">声 <select id="spk" onchange="cmd('speaker',this.value)"></select></div>
 <div class="row muted">対象: <span id="ag"></span></div>
@@ -143,18 +180,39 @@ ws.onmessage=async(e)=>{
  const p=document.getElementById("phase");
  p.innerHTML=m.phase+(m.playingText?'<div class="sub">🔊 '+m.playingText+"</div>":"");
  document.getElementById("conn").textContent=m.phase==="daemon未接続"?"daemon切断":"";
- document.getElementById("mic").className=m.voiceOn?"on":"";
- document.getElementById("mic").textContent=m.voiceOn?"🎙 マイク ON":"🎙 マイク";
+ document.getElementById("mic").className=m.voiceOn?(m.voiceReady?"on":""):"";
+ document.getElementById("mic").textContent=m.voiceOn?(m.voiceReady?"🎙 マイク ON":"🎙 準備中…"):"🎙 マイク";
  document.getElementById("reply").className=m.replyMuted?"":"on";
  document.getElementById("reply").textContent=m.replyMuted?"返答:文字だけ":"返答:音声+文字";
+ for(const b of document.querySelectorAll("#modes button[data-mode]"))b.className=b.dataset.mode===m.mode?"on":"";
  if(speakersLoaded)document.getElementById("spk").value=m.speaker;
 };
 document.getElementById("ag").textContent="${AGENT.slice(0,8)}";
 </script>`;
 
 const server = createServer(async (req, res) => {
+  // 入力欄など外部UIからの操作口（CORSはlocalhost間のみ想定）
+  res.setHeader("access-control-allow-origin", "*");
+  res.setHeader("access-control-allow-methods", "GET,POST,OPTIONS");
+  res.setHeader("access-control-allow-headers", "content-type");
+  if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
   if (req.url === "/") { res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" }); res.end(HTML); return; }
   if (req.url === "/state") { res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify(state())); return; }
+  if (req.method === "POST" && req.url === "/mode") {
+    let body = ""; for await (const c of req) body += c;
+    try {
+      const { mode } = JSON.parse(body);
+      if (!["off", "speak", "semi", "full"].includes(mode)) throw new Error("bad mode");
+      await applyMode(mode);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, mode: readMode() }));
+    } catch (e) { res.writeHead(400, { "Content-Type": "application/json" }); res.end(JSON.stringify({ ok: false, error: String(e.message ?? e) })); }
+    return;
+  }
+  if (req.method === "POST" && req.url === "/stop") {
+    writeFileSync(STOP_FLAG, String(Date.now()));
+    res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify({ ok: true })); return;
+  }
   res.writeHead(404); res.end();
 });
 
@@ -167,6 +225,7 @@ wss.on("connection", async (c) => {
     let m; try { m = JSON.parse(d); } catch { return; }
     if (m.type !== "cmd") return;
     if (m.cmd === "mic") await setVoice(!voiceOn);
+    if (m.cmd === "mode") await applyMode(String(m.value));
     if (m.cmd === "reply") { existsSync(MUTE_FLAG) ? (await import("node:fs")).rmSync(MUTE_FLAG, { force: true }) : writeFileSync(MUTE_FLAG, "1"); pushState(); }
     if (m.cmd === "stop") writeFileSync(STOP_FLAG, String(Date.now()));
     if (m.cmd === "speaker") writeFileSync(VOICE_PROFILE, JSON.stringify({ speaker: String(m.value) }));
